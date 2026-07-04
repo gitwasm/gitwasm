@@ -112,7 +112,24 @@ checksum = "aaa"
     git commit -q --allow-empty -m "feat: a proper conventional message"
     Assert ($LASTEXITCODE -eq 0) "4b. conventional message accepted"
 
-    Step "Demo complete - all four scenarios passed"
+    Step "Scenario 5: sign .gitwasm/, then tamper with a module - must refuse to run"
+    $env:GITWASM_KEY_PATH = Join-Path $PSScriptRoot "demo-signing-key"
+    if (Test-Path $env:GITWASM_KEY_PATH) { Remove-Item $env:GITWASM_KEY_PATH }
+    gitwasm keygen | Out-Null
+    gitwasm sign
+    if ($LASTEXITCODE -ne 0) { throw "gitwasm sign failed" }
+    git add .gitwasm; git commit -q -m "chore: sign gitwasm modules"
+    if ($LASTEXITCODE -ne 0) { throw "signed commit failed" }
+    Add-Content -Path .gitwasm\secret-scan.wasm -Value "x" -NoNewline   # the attack: swap/patch a committed module
+    gitwasm verify 2>&1 | Out-String | Write-Host
+    Assert ($LASTEXITCODE -ne 0) "5a. tampered module fails gitwasm verify"
+    git commit -q --allow-empty -m "feat: innocent looking commit" 2>&1 | Out-String | Write-Host
+    Assert ($LASTEXITCODE -ne 0) "5b. tampered module refuses to run - commit blocked fail-closed"
+    git checkout -q -- .gitwasm
+    git commit -q --allow-empty -m "feat: after restore everything works"
+    Assert ($LASTEXITCODE -eq 0) "5c. restored content verifies and runs again"
+
+    Step "Demo complete - all five scenarios passed"
     Write-Host "Every behavior above is a wasm blob COMMITTED IN THE REPO, running sandboxed"
     Write-Host "(one mounted directory, no network, no env, fuel + memory limits)."
     Write-Host "Anyone who clones and runs 'gitwasm install' gets identical behavior on any OS."

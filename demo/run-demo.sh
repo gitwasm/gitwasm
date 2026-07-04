@@ -104,5 +104,26 @@ ok "4a. non-conventional message rejected"
 git commit -q --allow-empty -m "feat: a proper conventional message"
 ok "4b. conventional message accepted"
 
-step "Demo complete - all four scenarios passed"
+step "Scenario 5: sign .gitwasm/, then tamper with a module - must refuse to run"
+export GITWASM_KEY_PATH="$ROOT/demo/demo-signing-key"
+rm -f "$GITWASM_KEY_PATH"
+gitwasm keygen > /dev/null
+gitwasm sign
+git add .gitwasm && git commit -q -m "chore: sign gitwasm modules"
+printf 'x' >> .gitwasm/secret-scan.wasm   # the attack: swap/patch a committed module
+if gitwasm verify; then
+    echo "DEMO FAILED: tampered module passed verify" >&2
+    exit 1
+fi
+ok "5a. tampered module fails gitwasm verify"
+if git commit -q --allow-empty -m "feat: innocent looking commit"; then
+    echo "DEMO FAILED: tampered module was allowed to run" >&2
+    exit 1
+fi
+ok "5b. tampered module refuses to run - commit blocked fail-closed"
+git checkout -q -- .gitwasm
+git commit -q --allow-empty -m "feat: after restore everything works"
+ok "5c. restored content verifies and runs again"
+
+step "Demo complete - all five scenarios passed"
 echo "Every behavior above is a wasm blob COMMITTED IN THE REPO, running sandboxed."

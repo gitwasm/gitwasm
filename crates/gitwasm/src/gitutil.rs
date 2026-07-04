@@ -24,6 +24,27 @@ pub fn git_string(cwd: &Path, args: &[&str]) -> Result<String> {
         .to_string())
 }
 
+/// Multi-valued config read; empty when unset (git exits 1 for that).
+pub fn git_config_all(cwd: &Path, key: &str) -> Result<Vec<String>> {
+    let out = Command::new("git")
+        .args(["config", "--get-all", key])
+        .current_dir(cwd)
+        .output()
+        .context("failed to spawn git")?;
+    if !out.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect())
+}
+
+/// Run git, ignoring failure (for idempotent cleanup like --unset-all).
+pub fn git_ignore_failure(cwd: &Path, args: &[&str]) {
+    let _ = Command::new("git").args(args).current_dir(cwd).output();
+}
+
 pub fn repo_root() -> Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     let root = git_string(&cwd, &["rev-parse", "--show-toplevel"])

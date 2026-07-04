@@ -4,6 +4,7 @@ members = [
     "crates/gitwasm",
     "modules/lockfile-merge",
     "modules/cargo-lock-merge",
+    "modules/lineset-merge",
     "modules/secret-scan",
     "modules/commit-lint",
 ]

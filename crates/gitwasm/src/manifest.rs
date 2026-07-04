@@ -42,6 +42,8 @@ pub struct Limits {
     pub fuel: u64,
     #[serde(default = "default_memory")]
     pub memory_bytes: u64,
+    #[serde(default = "default_wall_ms")]
+    pub wall_ms: u64,
 }
 
 impl Default for Limits {
@@ -49,6 +51,7 @@ impl Default for Limits {
         Limits {
             fuel: default_fuel(),
             memory_bytes: default_memory(),
+            wall_ms: default_wall_ms(),
         }
     }
 }
@@ -59,6 +62,10 @@ fn default_fuel() -> u64 {
 
 fn default_memory() -> u64 {
     512 * 1024 * 1024
+}
+
+fn default_wall_ms() -> u64 {
+    60_000 // catches what fuel can't: modules stalled in blocking syscalls
 }
 
 impl Manifest {

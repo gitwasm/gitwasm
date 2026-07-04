@@ -1,6 +1,6 @@
 [package]
 name = "cargo-lock-merge"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Structural 3-way merge for Cargo.lock — runs sandboxed inside gitwasm"
 

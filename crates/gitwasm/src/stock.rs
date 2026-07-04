@@ -20,9 +20,9 @@ pub const STOCK: &[StockModule] = &[
         file: "lockfile-merge.wasm",
         bytes: include_bytes!(concat!(env!("OUT_DIR"), "/lockfile-merge.wasm")),
         hook: None,
-        merge_patterns: &["package-lock.json"],
+        merge_patterns: &["package-lock.json", "package.json"],
         default_on: true,
-        summary: "structural 3-way merge for JSON lockfiles",
+        summary: "structural 3-way merge for JSON (package-lock.json, package.json)",
     },
     StockModule {
         file: "cargo-lock-merge.wasm",
@@ -31,6 +31,14 @@ pub const STOCK: &[StockModule] = &[
         merge_patterns: &["Cargo.lock"],
         default_on: true,
         summary: "structural 3-way merge for Cargo.lock",
+    },
+    StockModule {
+        file: "lineset-merge.wasm",
+        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/lineset-merge.wasm")),
+        hook: None,
+        merge_patterns: &["go.sum"],
+        default_on: true,
+        summary: "set-algebra 3-way merge for line-set files (go.sum)",
     },
     StockModule {
         file: "secret-scan.wasm",
@@ -73,11 +81,16 @@ pub fn default_manifest() -> String {
     )
 }
 
-/// The .gitattributes lines the default manifest needs.
+/// The .gitattributes lines the default manifest needs. The `-text` line is
+/// load-bearing: git EOL conversion would silently change file hashes across
+/// platforms and break signature verification.
 pub fn gitattributes_lines() -> Vec<String> {
-    STOCK
-        .iter()
-        .flat_map(|m| m.merge_patterns.iter())
-        .map(|p| format!("{p} merge=gitwasm"))
-        .collect()
+    let mut lines = vec![".gitwasm/** -text".to_string()];
+    lines.extend(
+        STOCK
+            .iter()
+            .flat_map(|m| m.merge_patterns.iter())
+            .map(|p| format!("{p} merge=gitwasm")),
+    );
+    lines
 }

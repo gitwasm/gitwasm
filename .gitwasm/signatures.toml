@@ -1,0 +1,16 @@
+# Written by `gitwasm sign` — hashes of every file in .gitwasm/ plus
+# ed25519 signatures over them. Verified fail-closed on every run.
+
+[files]
+"cargo-lock-merge.wasm" = "aa378a8f624f101d8ab9eff2edf511eecd247e2f98e1334c0b53a3fdcc348363"
+"commit-lint.wasm" = "d52a7f1187b19b2c3aca7c6dde0acfe24c94890b586f96cde7b52fd8e48bee3a"
+"hooks/commit-msg" = "81ae3076b360066444ee7d9932b9dbf10a138eedd0a8e3dc11a2a998cfb983eb"
+"hooks/pre-commit" = "40caebdce2143aa2558b7e35306e8bd2bbbb6fb4a899a9978644feaa42adc129"
+"lineset-merge.wasm" = "d8b3487eba9b0323c73e15a1b37a91f6742ad55886096f99f053a148122078a2"
+"lockfile-merge.wasm" = "fe676bc1eb05717503ec93b2d906b3644827fbcbe6e45247b5532663f52eb85b"
+"manifest.toml" = "374d38222c199464078787cd392d308c174456eae656e18e2a03eec7e920544c"
+"secret-scan.wasm" = "bb2d92da440f4ecbff1ee3ea07778960e1db186d738eb72c258f5591a2f84de0"
+
+[[signatures]]
+key = "63c7743a79ae772209c4705beaee7f61f4a2d01087965603391a9821b0256eaf"
+sig = "6643c1e6369d149bd42f7508ab1441a9117decd1195cc025b55a316d2aba67bd5b07939f7d4d81096cd12ef7a1676a7d84a452bdb2503f2900e7baadb1991e04"

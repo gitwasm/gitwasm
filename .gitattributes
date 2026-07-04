@@ -1,2 +1,5 @@
 package-lock.json merge=gitwasm
 Cargo.lock merge=gitwasm
+.gitwasm/** -text
+package.json merge=gitwasm
+go.sum merge=gitwasm

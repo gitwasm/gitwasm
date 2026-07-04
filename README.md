@@ -83,10 +83,17 @@ entire world; message hooks additionally get the message as `COMMIT_MSG`.
 the module writes `result`; nonzero exit leaves a normal git conflict for the
 human. Every run is fuel- and memory-limited.
 
+## Signing
+
+`gitwasm keygen` once, `gitwasm sign` after changing `.gitwasm/`: every file
+(including the hook shims) is hashed and ed25519-signed. Collaborators' clones
+pin the signing key at `gitwasm install`; from then on tampered or unsigned
+`.gitwasm/` content **refuses to execute**. Details in [SPEC.md](SPEC.md) §6
+and [SECURITY.md](SECURITY.md).
+
 ## Roadmap
 
-- **Signed manifests** — trust policy over who may change `.gitwasm/`.
-- More drivers: `yarn.lock`, `poetry.lock`, `go.sum`; tree-sitter semantic
+- More drivers: `yarn.lock`, `poetry.lock`; tree-sitter semantic
   merge for source files.
 - WASI 0.2 component-model module interface (typed I/O) alongside preview1.
 - **Deterministic, memoized checks**: every run is a pure function

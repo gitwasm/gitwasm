@@ -95,7 +95,42 @@ Modules are WebAssembly **WASI preview1 command modules**: a `_start` export,
 spec revision will add a WASI 0.2 component-model interface with typed I/O;
 hosts should expect both to coexist.
 
-## 6. Determinism
+## 6. Signing (optional but recommended)
+
+`.gitwasm/signatures.toml` records a sha256 hash of **every other file under
+`.gitwasm/`** (module blobs, manifest, hook shims — shims especially, since
+git executes them natively) plus one or more ed25519 signatures:
+
+```toml
+[files]
+"manifest.toml" = "<sha256 hex>"
+"hooks/pre-commit" = "<sha256 hex>"
+"secret-scan.wasm" = "<sha256 hex>"
+
+[[signatures]]
+key = "<ed25519 public key, hex>"
+sig = "<ed25519 signature, hex>"
+```
+
+The signed payload is the exact byte string:
+
+```
+"gitwasm-signatures-v1\n" + for each file in lexicographic name order:
+    name + "\n" + sha256hex + "\n"
+```
+
+Trust semantics: at activation (`gitwasm install`) a host pins the currently
+valid signing keys into **local, per-clone** state (trust-on-first-use;
+activation is already the explicit trust decision). Once keys are pinned, the
+host MUST verify before every module run and MUST refuse to execute
+(fail-closed) if content is unsigned, tampered, or signed only by unpinned
+keys. Re-pinning after a legitimate key rotation is an explicit user action
+(`gitwasm trust`).
+
+Repos MUST carry a `.gitwasm/** -text` gitattributes line: EOL conversion
+would otherwise change file hashes between platforms and break verification.
+
+## 7. Determinism
 
 Modules SHOULD be deterministic: given identical mounts and argv, produce
 identical outputs. The contract above gives modules no ambient sources of

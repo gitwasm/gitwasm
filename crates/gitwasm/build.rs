@@ -9,6 +9,7 @@ use std::process::Command;
 const STOCK_MODULES: &[&str] = &[
     "lockfile-merge",
     "cargo-lock-merge",
+    "lineset-merge",
     "secret-scan",
     "commit-lint",
 ];

@@ -1,6 +1,6 @@
 [package]
 name = "secret-scan"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Pre-commit secret scanner — runs sandboxed inside gitwasm over the staged tree"
 

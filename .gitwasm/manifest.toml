@@ -10,5 +10,13 @@ pattern = "package-lock.json"
 module = "lockfile-merge.wasm"
 
 [[merge]]
+pattern = "package.json"
+module = "lockfile-merge.wasm"
+
+[[merge]]
 pattern = "Cargo.lock"
 module = "cargo-lock-merge.wasm"
+
+[[merge]]
+pattern = "go.sum"
+module = "lineset-merge.wasm"

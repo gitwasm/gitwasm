@@ -1,0 +1,7 @@
+[package]
+name = "lineset-merge"
+version = "0.2.0"
+edition = "2021"
+description = "3-way merge for line-set files like go.sum — runs sandboxed inside gitwasm"
+
+[dependencies]

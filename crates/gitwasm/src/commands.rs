@@ -1,10 +1,69 @@
-use crate::gitutil::{git_bytes, git_string, repo_root};
+use crate::gitutil::{git_bytes, git_config_all, git_ignore_failure, git_string, repo_root};
 use crate::manifest::{Manifest, GITWASM_DIR, MANIFEST_FILE};
 use crate::runner::{run_module, Sandbox};
+use crate::signing::{self, VerifyOutcome};
 use crate::stock;
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
+
+const TRUSTED_KEY_CONFIG: &str = "gitwasm.trustedkey";
+
+/// Fail-closed signature enforcement, called before any module runs.
+/// A clone that never pinned keys runs unsigned repos as before; once keys
+/// are pinned (at install/trust time), unsigned or tampered `.gitwasm/`
+/// content refuses to execute.
+fn enforce_trust(root: &Path) -> Result<()> {
+    let trusted = git_config_all(root, TRUSTED_KEY_CONFIG)?;
+    if trusted.is_empty() {
+        return Ok(());
+    }
+    match signing::verify_dir(&root.join(GITWASM_DIR))? {
+        VerifyOutcome::Valid(keys) if keys.iter().any(|k| trusted.contains(k)) => Ok(()),
+        VerifyOutcome::Valid(keys) => bail!(
+            ".gitwasm/ is signed, but by no key this clone trusts (signers: {}). \
+             If a key rotation is expected, review the change and run `gitwasm trust`",
+            keys.iter()
+                .map(|k| signing::fingerprint(k))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        VerifyOutcome::Unsigned => bail!(
+            "this clone pins trusted signing keys but .gitwasm/ is unsigned — refusing to run modules"
+        ),
+        VerifyOutcome::Invalid(reason) => bail!(
+            ".gitwasm/ failed signature verification ({reason}) — refusing to run modules"
+        ),
+    }
+}
+
+/// Pin the currently-valid signing keys into local git config (TOFU).
+fn pin_signers(root: &Path) -> Result<()> {
+    match signing::verify_dir(&root.join(GITWASM_DIR))? {
+        VerifyOutcome::Valid(keys) => {
+            let trusted = git_config_all(root, TRUSTED_KEY_CONFIG)?;
+            for key in &keys {
+                if !trusted.contains(key) {
+                    git_string(root, &["config", "--add", TRUSTED_KEY_CONFIG, key])?;
+                }
+                println!(
+                    "gitwasm: trusting signing key {} for this clone",
+                    signing::fingerprint(key)
+                );
+            }
+        }
+        VerifyOutcome::Unsigned => {
+            println!(
+                "gitwasm: note: .gitwasm/ is unsigned (maintainers: `gitwasm keygen` + `gitwasm sign`)"
+            );
+        }
+        VerifyOutcome::Invalid(reason) => bail!(
+            ".gitwasm/ has a signatures.toml that does NOT verify ({reason}) — \
+             refusing to activate; inspect the repo before proceeding"
+        ),
+    }
+    Ok(())
+}
 
 /// Scaffold `.gitwasm/` with the embedded stock modules, wire up
 /// `.gitattributes`, and activate. One command from zero to protected repo.
@@ -109,8 +168,100 @@ pub fn install() -> Result<i32> {
     for rule in &manifest.merge {
         println!("gitwasm: merge rule {} -> {}", rule.pattern, rule.module);
     }
+    pin_signers(&root)?;
     println!("gitwasm: installed (core.hooksPath + merge.gitwasm.driver set for this clone)");
     Ok(0)
+}
+
+/// Generate a signing keypair (stored outside any repo).
+pub fn keygen() -> Result<i32> {
+    let path = signing::key_path()?;
+    let key = signing::generate_key(&path)?;
+    let public = hex::encode(key.verifying_key().to_bytes());
+    println!(
+        "gitwasm: new signing key {} at {}",
+        signing::fingerprint(&public),
+        path.display()
+    );
+    println!("gitwasm: public key: {public}");
+    Ok(0)
+}
+
+/// Sign the current contents of `.gitwasm/` and pin our own key locally.
+pub fn sign() -> Result<i32> {
+    let root = repo_root()?;
+    let dir = root.join(GITWASM_DIR);
+    if !dir.join(MANIFEST_FILE).exists() {
+        bail!(
+            "no {}/{} to sign — run `gitwasm init` first",
+            GITWASM_DIR,
+            MANIFEST_FILE
+        );
+    }
+    let key = signing::load_key()?;
+    let files = signing::collect_files(&dir)?;
+    fs::write(
+        dir.join(signing::SIGNATURES_FILE),
+        signing::render_signatures(&files, &key),
+    )?;
+    println!(
+        "gitwasm: signed {} file(s) with key {}",
+        files.len(),
+        signing::fingerprint(&hex::encode(key.verifying_key().to_bytes()))
+    );
+    pin_signers(&root)?;
+    println!(
+        "gitwasm: commit {}/{} to publish",
+        GITWASM_DIR,
+        signing::SIGNATURES_FILE
+    );
+    Ok(0)
+}
+
+/// Explicit verification (also for CI). Exit 1 on tampered/invalid content.
+pub fn verify() -> Result<i32> {
+    let root = repo_root()?;
+    let trusted = git_config_all(&root, TRUSTED_KEY_CONFIG)?;
+    match signing::verify_dir(&root.join(GITWASM_DIR))? {
+        VerifyOutcome::Valid(keys) => {
+            for key in &keys {
+                let status = if trusted.contains(key) {
+                    "trusted by this clone"
+                } else {
+                    "NOT pinned here"
+                };
+                println!(
+                    "gitwasm: valid signature by {} ({status})",
+                    signing::fingerprint(key)
+                );
+            }
+            Ok(0)
+        }
+        VerifyOutcome::Unsigned => {
+            println!("gitwasm: .gitwasm/ is unsigned");
+            Ok(0)
+        }
+        VerifyOutcome::Invalid(reason) => {
+            eprintln!("gitwasm: VERIFICATION FAILED: {reason}");
+            Ok(1)
+        }
+    }
+}
+
+/// Re-pin trust to the current (valid) signers — for legitimate key rotation.
+pub fn trust() -> Result<i32> {
+    let root = repo_root()?;
+    match signing::verify_dir(&root.join(GITWASM_DIR))? {
+        VerifyOutcome::Valid(_) => {
+            git_ignore_failure(&root, &["config", "--unset-all", TRUSTED_KEY_CONFIG]);
+            pin_signers(&root)?;
+            Ok(0)
+        }
+        VerifyOutcome::Unsigned => bail!("nothing to trust: .gitwasm/ is unsigned"),
+        VerifyOutcome::Invalid(reason) => {
+            bail!("refusing to trust content that fails verification: {reason}")
+        }
+    }
 }
 
 /// Show what the current repo's manifest activates.
@@ -141,6 +292,7 @@ pub fn list() -> Result<i32> {
 /// the message file is copied in as COMMIT_MSG and passed as argv[1].
 pub fn hook(name: &str, hook_args: &[String]) -> Result<i32> {
     let root = repo_root()?;
+    enforce_trust(&root)?;
     let manifest = Manifest::load(&root)?;
     let Some(module_name) = manifest.hooks.get(name) else {
         return Ok(0); // no module registered for this hook — allow
@@ -198,6 +350,7 @@ pub fn hook(name: &str, hook_args: &[String]) -> Result<i32> {
 /// On success the merged result must be left in %A.
 pub fn merge(base: &str, ours: &str, theirs: &str, path: &str) -> Result<i32> {
     let root = repo_root()?;
+    enforce_trust(&root)?;
     let manifest = Manifest::load(&root)?;
     let Some(module_name) = manifest.merge_module(path) else {
         eprintln!("gitwasm: no merge module matches '{path}' — leaving conflict for git");
