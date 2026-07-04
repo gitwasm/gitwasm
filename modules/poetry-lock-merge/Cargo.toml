@@ -1,0 +1,8 @@
+[package]
+name = "poetry-lock-merge"
+version = "0.3.0"
+edition = "2021"
+description = "Structural 3-way merge for poetry.lock — runs sandboxed inside gitwasm"
+
+[dependencies]
+toml = "0.8"

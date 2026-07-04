@@ -10,6 +10,8 @@ const STOCK_MODULES: &[&str] = &[
     "lockfile-merge",
     "cargo-lock-merge",
     "lineset-merge",
+    "yarn-lock-merge",
+    "poetry-lock-merge",
     "secret-scan",
     "commit-lint",
 ];

@@ -41,6 +41,22 @@ pub const STOCK: &[StockModule] = &[
         summary: "set-algebra 3-way merge for line-set files (go.sum)",
     },
     StockModule {
+        file: "yarn-lock-merge.wasm",
+        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/yarn-lock-merge.wasm")),
+        hook: None,
+        merge_patterns: &["yarn.lock"],
+        default_on: true,
+        summary: "structural 3-way merge for yarn.lock v1",
+    },
+    StockModule {
+        file: "poetry-lock-merge.wasm",
+        bytes: include_bytes!(concat!(env!("OUT_DIR"), "/poetry-lock-merge.wasm")),
+        hook: None,
+        merge_patterns: &["poetry.lock"],
+        default_on: true,
+        summary: "structural 3-way merge for poetry.lock",
+    },
+    StockModule {
         file: "secret-scan.wasm",
         bytes: include_bytes!(concat!(env!("OUT_DIR"), "/secret-scan.wasm")),
         hook: Some("pre-commit"),

@@ -5,6 +5,8 @@ members = [
     "modules/lockfile-merge",
     "modules/cargo-lock-merge",
     "modules/lineset-merge",
+    "modules/yarn-lock-merge",
+    "modules/poetry-lock-merge",
     "modules/secret-scan",
     "modules/commit-lint",
 ]
