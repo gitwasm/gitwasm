@@ -83,9 +83,22 @@ fn merge3(
                 Some(Value::Object(m)) => m,
                 _ => &empty,
             };
-            let mut keys: Vec<&String> = b.keys().chain(o.keys()).chain(t.keys()).collect();
-            keys.sort();
-            keys.dedup();
+            // Key order matters to the tools that own these files: npm keeps
+            // dependency maps alphabetized, but e.g. package.json's top level
+            // is deliberately unsorted. Mirror whatever the inputs do — if all
+            // sides are sorted, insert additions in sorted position; otherwise
+            // preserve base order and append each side's additions in its own
+            // order.
+            let mut keys: Vec<&String> = Vec::new();
+            for key in b.keys().chain(o.keys()).chain(t.keys()) {
+                if !keys.contains(&key) {
+                    keys.push(key);
+                }
+            }
+            let all_sorted = [b, o, t].iter().all(|m| m.keys().is_sorted());
+            if all_sorted {
+                keys.sort();
+            }
             let mut out = Map::new();
             for key in keys {
                 let child_path = format!("{path}.{key}");
@@ -172,6 +185,26 @@ mod tests {
         let ours = json!({"b": 2});
         let theirs = json!({"b": 2});
         assert_eq!(run(base, ours, theirs).unwrap(), json!({"b": 2}));
+    }
+
+    #[test]
+    fn sorted_maps_get_additions_in_sorted_position() {
+        let base = json!({"a": 1, "m": 1, "z": 1});
+        let ours = json!({"a": 1, "b": 1, "m": 1, "z": 1});
+        let theirs = json!({"a": 1, "m": 1, "n": 1, "z": 1});
+        let merged = run(base, ours, theirs).unwrap();
+        let keys: Vec<&String> = merged.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["a", "b", "m", "n", "z"]);
+    }
+
+    #[test]
+    fn unsorted_maps_keep_base_order_and_append() {
+        let base = json!({"name": "x", "version": "1", "dependencies": {}});
+        let ours = json!({"name": "x", "version": "1", "dependencies": {}, "scripts": {}});
+        let theirs = json!({"name": "x", "version": "2", "dependencies": {}});
+        let merged = run(base, ours, theirs).unwrap();
+        let keys: Vec<&String> = merged.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["name", "version", "dependencies", "scripts"]);
     }
 
     #[test]
