@@ -48,10 +48,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aaa"
 EOF
 
-step "gitwasm init - one command from zero to protected repo"
-gitwasm init
+step "gitwasm init lockfiles - one command from zero to lockfile conflict protection"
+gitwasm init lockfiles
 git add -A
 git commit -q -m "chore: adopt gitwasm"
+
+step "Enable the default hook pack for policy scenarios"
+cp "$ROOT/.gitwasm/secret-scan.wasm" "$ROOT/.gitwasm/commit-lint.wasm" .gitwasm/
+if ! grep -q '^pre-commit = "secret-scan.wasm"' .gitwasm/manifest.toml; then
+    sed -i.bak '/^\[hooks\]/a pre-commit = "secret-scan.wasm"' .gitwasm/manifest.toml
+    rm .gitwasm/manifest.toml.bak
+fi
+if ! grep -q '^# commit-msg = "commit-lint.wasm"' .gitwasm/manifest.toml && \
+    ! grep -q '^commit-msg = "commit-lint.wasm"' .gitwasm/manifest.toml; then
+    sed -i.bak '/^pre-commit = "secret-scan.wasm"/a # commit-msg = "commit-lint.wasm"' .gitwasm/manifest.toml
+    rm .gitwasm/manifest.toml.bak
+fi
+gitwasm install
+git add -A
+git commit -q -m "chore: enable gitwasm hooks"
 gitwasm list
 
 step "Scenario 1: npm lockfile - both branches add a dependency (adjacent lines)"
@@ -80,7 +95,54 @@ git merge cargo-feature -m "Merge branch 'cargo-feature'"
 grep -q '1\.0\.150' Cargo.lock && ! grep -q '1\.0\.120' Cargo.lock
 ok "2. Cargo.lock merged clean, higher version (1.0.150) won"
 
-step "Scenario 3: go.sum merges via a typed WASI 0.2 component (imports nothing)"
+step "Scenario 3: pnpm-lock.yaml - both branches add a dependency"
+cat > pnpm-lock.yaml <<'EOF'
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      express:
+        specifier: ^4.19.0
+        version: 4.19.2
+
+packages:
+  express@4.19.2:
+    resolution: {integrity: sha512-express}
+
+snapshots:
+  express@4.19.2: {}
+EOF
+git add pnpm-lock.yaml && git commit -q -m "chore: add pnpm lock baseline"
+git checkout -q -b pnpm-feature
+python3 - <<'PY'
+from pathlib import Path
+p = Path("pnpm-lock.yaml")
+s = p.read_text()
+s = s.replace("      express:\n        specifier: ^4.19.0\n        version: 4.19.2\n", "      express:\n        specifier: ^4.19.0\n        version: 4.19.2\n      left-pad:\n        specifier: ^1.3.0\n        version: 1.3.0\n")
+s = s.replace("  express@4.19.2:\n    resolution: {integrity: sha512-express}\n", "  express@4.19.2:\n    resolution: {integrity: sha512-express}\n  left-pad@1.3.0:\n    resolution: {integrity: sha512-left}\n")
+s = s.replace("  express@4.19.2: {}\n", "  express@4.19.2: {}\n  left-pad@1.3.0: {}\n")
+p.write_text(s)
+PY
+git commit -q -am "feat: add left-pad to pnpm lock"
+git checkout -q main
+python3 - <<'PY'
+from pathlib import Path
+p = Path("pnpm-lock.yaml")
+s = p.read_text()
+s = s.replace("      express:\n        specifier: ^4.19.0\n        version: 4.19.2\n", "      express:\n        specifier: ^4.19.0\n        version: 4.19.2\n      right-pad:\n        specifier: ^1.0.1\n        version: 1.0.1\n")
+s = s.replace("  express@4.19.2:\n    resolution: {integrity: sha512-express}\n", "  express@4.19.2:\n    resolution: {integrity: sha512-express}\n  right-pad@1.0.1:\n    resolution: {integrity: sha512-right}\n")
+s = s.replace("  express@4.19.2: {}\n", "  express@4.19.2: {}\n  right-pad@1.0.1: {}\n")
+p.write_text(s)
+PY
+git commit -q -am "feat: add right-pad to pnpm lock"
+git merge pnpm-feature -m "Merge branch 'pnpm-feature'"
+grep -q '^      left-pad:$' pnpm-lock.yaml && grep -q '^      right-pad:$' pnpm-lock.yaml
+grep -q '^  left-pad@1\.3\.0:$' pnpm-lock.yaml && grep -q '^  right-pad@1\.0\.1:$' pnpm-lock.yaml
+grep -q '^  left-pad@1\.3\.0: {}$' pnpm-lock.yaml && grep -q '^  right-pad@1\.0\.1: {}$' pnpm-lock.yaml
+ok "3. pnpm-lock.yaml merged clean with both dependencies"
+
+step "Scenario 4: go.sum merges via a typed WASI 0.2 component (imports nothing)"
 printf 'golang.org/x/sys v0.1.0 h1:base=\ngolang.org/x/sys v0.1.0/go.mod h1:base=\n' > go.sum
 git add go.sum && git commit -q -m "chore: add go.sum baseline"
 git checkout -q -b gosum-feature
@@ -91,9 +153,9 @@ printf 'golang.org/x/net v0.5.0 h1:net=\ngolang.org/x/net v0.5.0/go.mod h1:net=\
 git commit -q -am "feat: add x/net to go.sum"
 git merge gosum-feature -m "Merge branch 'gosum-feature'"
 grep -q 'x/text' go.sum && grep -q 'x/net' go.sum && grep -q 'x/sys' go.sum
-ok "3. go.sum merged clean by a component that never sees a filesystem"
+ok "4. go.sum merged clean by a component that never sees a filesystem"
 
-step "Scenario 4: staged AWS key must block the commit"
+step "Scenario 5: staged AWS key must block the commit"
 # Assembled at runtime so this script itself never contains a key-shaped literal.
 printf 'const awsKey = "%s%s";\n' 'AKIA' 'IOSFODNN7EXAMPLE' > config.js
 git add config.js
@@ -101,23 +163,23 @@ if git commit -q -m "feat: add config"; then
     echo "DEMO FAILED: commit with AWS key went through" >&2
     exit 1
 fi
-ok "4. commit with AWS key was blocked by sandboxed pre-commit"
+ok "5. commit with AWS key was blocked by sandboxed pre-commit"
 echo 'const awsKey = process.env.AWS_ACCESS_KEY_ID;' > config.js
 git add config.js
 git commit -q -m "feat: add config (key from env)"
 
-step "Scenario 5: enable opt-in commit-lint, reject a sloppy message"
+step "Scenario 6: enable opt-in commit-lint, reject a sloppy message"
 sed -i.bak 's/# commit-msg/commit-msg/' .gitwasm/manifest.toml && rm .gitwasm/manifest.toml.bak
 gitwasm install > /dev/null
 if git commit -q --allow-empty -m "asdf"; then
     echo "DEMO FAILED: non-conventional message accepted" >&2
     exit 1
 fi
-ok "5a. non-conventional message rejected"
+ok "6a. non-conventional message rejected"
 git commit -q --allow-empty -m "feat: a proper conventional message"
-ok "5b. conventional message accepted"
+ok "6b. conventional message accepted"
 
-step "Scenario 6: sign .gitwasm/, then tamper with a module - must refuse to run"
+step "Scenario 7: sign .gitwasm/, then tamper with a module - must refuse to run"
 export GITWASM_KEY_PATH="$ROOT/demo/demo-signing-key"
 rm -f "$GITWASM_KEY_PATH"
 gitwasm keygen > /dev/null
@@ -128,17 +190,17 @@ if gitwasm verify; then
     echo "DEMO FAILED: tampered module passed verify" >&2
     exit 1
 fi
-ok "6a. tampered module fails gitwasm verify"
+ok "7a. tampered module fails gitwasm verify"
 if git commit -q --allow-empty -m "feat: innocent looking commit"; then
     echo "DEMO FAILED: tampered module was allowed to run" >&2
     exit 1
 fi
-ok "6b. tampered module refuses to run - commit blocked fail-closed"
+ok "7b. tampered module refuses to run - commit blocked fail-closed"
 git checkout -q -- .gitwasm
 git commit -q --allow-empty -m "feat: after restore everything works"
-ok "6c. restored content verifies and runs again"
+ok "7c. restored content verifies and runs again"
 
-step "Scenario 7: verdicts - every merge above is a re-derivable, cached fact"
+step "Scenario 8: verdicts - every merge above is a re-derivable, cached fact"
 gitwasm verdicts
 gitwasm audit                       # re-derive all recorded verdicts from content-addressed inputs
 VDIR="$(git rev-parse --absolute-git-dir)/gitwasm/verdicts"
@@ -148,10 +210,10 @@ if gitwasm audit; then
     echo "DEMO FAILED: a forged verdict passed audit" >&2
     exit 1
 fi
-ok "7a. a forged verdict fails re-derivation - you cannot lie about a verdict"
+ok "8a. a forged verdict fails re-derivation - you cannot lie about a verdict"
 sed -i.bak 's/^exit_code = 1/exit_code = 0/' "$V" && rm "$V.bak"
 gitwasm audit > /dev/null
-ok "7b. restored verdict re-derives - merges are cached and trustlessly checkable"
+ok "8b. restored verdict re-derives - merges are cached and trustlessly checkable"
 
-step "Demo complete - all seven scenarios passed"
+step "Demo complete - all eight scenarios passed"
 echo "Every behavior above is a wasm blob COMMITTED IN THE REPO, running sandboxed."
