@@ -12,6 +12,62 @@ use std::path::Path;
 
 const TRUSTED_KEY_CONFIG: &str = "gitwasm.trustedkey";
 
+fn parse_init_profile(arg: Option<&str>) -> Result<stock::InitProfile> {
+    match arg.unwrap_or("all") {
+        "all" => Ok(stock::InitProfile::All),
+        "lockfiles" => Ok(stock::InitProfile::Lockfiles),
+        "hooks" => Ok(stock::InitProfile::Hooks),
+        other => bail!("unknown init profile '{other}' — expected one of: all, lockfiles, hooks"),
+    }
+}
+
+fn gitwasm_hooks_path(root: &Path) -> String {
+    root.join(GITWASM_DIR)
+        .join("hooks")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn trim_trailing_slashes(value: &str) -> &str {
+    value.trim_end_matches(['/', '\\'])
+}
+
+fn is_gitwasm_hooks_path(root: &Path, value: &str) -> bool {
+    let value = trim_trailing_slashes(value);
+    let normalized = value.replace('\\', "/");
+    normalized == ".gitwasm/hooks" || normalized == trim_trailing_slashes(&gitwasm_hooks_path(root))
+}
+
+fn exact_config_value_regex(value: &str) -> String {
+    let mut regex = String::from("^");
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        ) {
+            regex.push('\\');
+        }
+        regex.push(ch);
+    }
+    regex.push('$');
+    regex
+}
+
+fn clear_stale_gitwasm_hooks_path(root: &Path) -> Result<bool> {
+    let mut cleared = false;
+    for hooks_path in git_config_all(root, "core.hooksPath")? {
+        if is_gitwasm_hooks_path(root, &hooks_path) {
+            let value_regex = exact_config_value_regex(&hooks_path);
+            git_ignore_failure(
+                root,
+                &["config", "--unset-all", "core.hooksPath", &value_regex],
+            );
+            cleared = true;
+        }
+    }
+    Ok(cleared)
+}
+
 /// Fail-closed signature enforcement, called before any module runs.
 /// A clone that never pinned keys runs unsigned repos as before; once keys
 /// are pinned (at install/trust time), unsigned or tampered `.gitwasm/`
@@ -70,7 +126,8 @@ fn pin_signers(root: &Path) -> Result<()> {
 
 /// Scaffold `.gitwasm/` with the embedded stock modules, wire up
 /// `.gitattributes`, and activate. One command from zero to protected repo.
-pub fn init() -> Result<i32> {
+pub fn init(profile_arg: Option<&str>) -> Result<i32> {
+    let profile = parse_init_profile(profile_arg)?;
     let root = repo_root()?;
     let dir = root.join(GITWASM_DIR);
     if dir.join(MANIFEST_FILE).exists() {
@@ -82,18 +139,26 @@ pub fn init() -> Result<i32> {
     }
     fs::create_dir_all(&dir)?;
 
-    for module in stock::STOCK {
+    println!("gitwasm: init profile '{}'", profile.name());
+    for module in stock::modules_for(profile) {
         fs::write(dir.join(module.file), module.bytes)?;
-        let state = if module.default_on { "on " } else { "off" };
+        let state = if profile == stock::InitProfile::Lockfiles || module.default_on {
+            "on "
+        } else {
+            "off"
+        };
         println!("gitwasm: [{state}] {: <22} {}", module.file, module.summary);
     }
-    fs::write(dir.join(MANIFEST_FILE), stock::default_manifest())?;
+    fs::write(
+        dir.join(MANIFEST_FILE),
+        stock::default_manifest_for(profile),
+    )?;
 
     // Append (never clobber) the merge-driver attributes.
     let attributes = root.join(".gitattributes");
     let existing = fs::read_to_string(&attributes).unwrap_or_default();
     let mut additions = String::new();
-    for line in stock::gitattributes_lines() {
+    for line in stock::gitattributes_lines_for(profile) {
         if !existing.lines().any(|l| l.trim() == line) {
             additions.push_str(&line);
             additions.push('\n');
@@ -121,36 +186,46 @@ pub fn install() -> Result<i32> {
     let root = repo_root()?;
     let manifest = Manifest::load(&root)?;
 
-    let hooks_dir = root.join(GITWASM_DIR).join("hooks");
-    fs::create_dir_all(&hooks_dir)?;
-    for hook_name in manifest.hooks.keys() {
-        let shim = hooks_dir.join(hook_name);
-        // sh shim, LF endings — git for Windows runs hooks through its bundled sh.
-        // Fails open when gitwasm isn't on PATH: a collaborator without the
-        // tool gets a warning, not an unusable repo.
-        fs::write(
-            &shim,
-            format!(
-                "#!/bin/sh\n\
-                 if command -v gitwasm >/dev/null 2>&1; then\n\
-                 \x20 exec gitwasm hook {hook_name} \"$@\"\n\
-                 fi\n\
-                 echo \"gitwasm: not on PATH; skipping {hook_name} hook (see .gitwasm/)\" >&2\n"
-            ),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    let hooks_configured = !manifest.hooks.is_empty();
+    let stale_hooks_path_cleared = if hooks_configured {
+        let hooks_dir = root.join(GITWASM_DIR).join("hooks");
+        fs::create_dir_all(&hooks_dir)?;
+        for hook_name in manifest.hooks.keys() {
+            let shim = hooks_dir.join(hook_name);
+            // sh shim, LF endings — git for Windows runs hooks through its bundled sh.
+            // Fails open when gitwasm isn't on PATH: a collaborator without the
+            // tool gets a warning, not an unusable repo.
+            fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\n\
+                     if command -v gitwasm >/dev/null 2>&1; then\n\
+                     \x20 exec gitwasm hook {hook_name} \"$@\"\n\
+                     fi\n\
+                     echo \"gitwasm: not on PATH; skipping {hook_name} hook (see .gitwasm/)\" >&2\n"
+                ),
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+            }
+            println!(
+                "gitwasm: hook shim  {hook_name} -> {}",
+                manifest.hooks[hook_name]
+            );
         }
-        println!(
-            "gitwasm: hook shim  {hook_name} -> {}",
-            manifest.hooks[hook_name]
-        );
-    }
 
-    let hooks_path = hooks_dir.to_string_lossy().replace('\\', "/");
-    git_string(&root, &["config", "core.hooksPath", &hooks_path])?;
+        let hooks_path = gitwasm_hooks_path(&root);
+        git_string(&root, &["config", "core.hooksPath", &hooks_path])?;
+        false
+    } else if clear_stale_gitwasm_hooks_path(&root)? {
+        println!("gitwasm: cleared stale core.hooksPath for no-hook manifest");
+        true
+    } else {
+        println!("gitwasm: no hooks enabled by this manifest");
+        false
+    };
     git_string(
         &root,
         &[
@@ -172,7 +247,15 @@ pub fn install() -> Result<i32> {
         println!("gitwasm: merge rule {} -> {}", rule.pattern, rule.module);
     }
     pin_signers(&root)?;
-    println!("gitwasm: installed (core.hooksPath + merge.gitwasm.driver set for this clone)");
+    if hooks_configured {
+        println!("gitwasm: installed (core.hooksPath + merge.gitwasm.driver set for this clone)");
+    } else if stale_hooks_path_cleared {
+        println!(
+            "gitwasm: installed (merge.gitwasm.driver set for this clone; stale core.hooksPath cleared)"
+        );
+    } else {
+        println!("gitwasm: installed (merge.gitwasm.driver set for this clone; no hooks enabled)");
+    }
     Ok(0)
 }
 
@@ -694,6 +777,59 @@ pub fn run_direct(wasm: &str, args: &[String]) -> Result<i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_init_profile_defaults_to_all() {
+        assert_eq!(parse_init_profile(None).unwrap(), stock::InitProfile::All);
+    }
+
+    #[test]
+    fn parse_init_profile_accepts_named_profiles() {
+        assert_eq!(
+            parse_init_profile(Some("lockfiles")).unwrap(),
+            stock::InitProfile::Lockfiles
+        );
+        assert_eq!(
+            parse_init_profile(Some("hooks")).unwrap(),
+            stock::InitProfile::Hooks
+        );
+        assert_eq!(
+            parse_init_profile(Some("all")).unwrap(),
+            stock::InitProfile::All
+        );
+    }
+
+    #[test]
+    fn parse_init_profile_rejects_unknown_profile() {
+        let err = parse_init_profile(Some("everything")).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown init profile"));
+        assert!(format!("{err:#}").contains("lockfiles"));
+    }
+
+    #[test]
+    fn gitwasm_hooks_path_matches_absolute_managed_path() {
+        let root = Path::new("/tmp/example-repo");
+        assert!(is_gitwasm_hooks_path(
+            root,
+            "/tmp/example-repo/.gitwasm/hooks"
+        ));
+    }
+
+    #[test]
+    fn gitwasm_hooks_path_matches_relative_managed_path() {
+        let root = Path::new("/tmp/example-repo");
+        assert!(is_gitwasm_hooks_path(root, ".gitwasm/hooks"));
+    }
+
+    #[test]
+    fn gitwasm_hooks_path_rejects_user_owned_path() {
+        let root = Path::new("/tmp/example-repo");
+        assert!(!is_gitwasm_hooks_path(root, ".githooks"));
+        assert!(!is_gitwasm_hooks_path(
+            root,
+            "/tmp/example-repo/custom-hooks"
+        ));
+    }
 
     fn lineset_component() -> &'static [u8] {
         stock::STOCK

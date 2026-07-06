@@ -15,8 +15,6 @@ pub struct StockModule {
     pub summary: &'static str,
 }
 
-// The non-default profiles are wired into the CLI in the next task; tests exercise them here.
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InitProfile {
     All,
@@ -145,6 +143,7 @@ pub fn default_manifest_for(profile: InitProfile) -> String {
 }
 
 /// Render the default manifest.toml for `gitwasm init`.
+#[allow(dead_code)]
 pub fn default_manifest() -> String {
     default_manifest_for(InitProfile::All)
 }
@@ -163,6 +162,7 @@ pub fn gitattributes_lines_for(profile: InitProfile) -> Vec<String> {
     lines
 }
 
+#[allow(dead_code)]
 pub fn gitattributes_lines() -> Vec<String> {
     gitattributes_lines_for(InitProfile::All)
 }
