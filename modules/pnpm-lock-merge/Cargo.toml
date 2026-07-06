@@ -1,0 +1,8 @@
+[package]
+name = "pnpm-lock-merge"
+version = "0.1.0"
+edition = "2021"
+description = "Structural 3-way merge for pnpm-lock.yaml — runs sandboxed inside gitwasm"
+
+[dependencies]
+serde_yaml = "0.9"

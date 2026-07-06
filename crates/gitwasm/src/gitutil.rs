@@ -51,3 +51,11 @@ pub fn repo_root() -> Result<PathBuf> {
         .context("not inside a git repository")?;
     Ok(PathBuf::from(root))
 }
+
+/// The absolute `.git` directory — where per-clone gitwasm state (the verdict
+/// cache) lives, alongside git's own. Handles worktrees and `$GIT_DIR`.
+pub fn git_dir(cwd: &Path) -> Result<PathBuf> {
+    let dir = git_string(cwd, &["rev-parse", "--absolute-git-dir"])
+        .context("locating the .git directory")?;
+    Ok(PathBuf::from(dir))
+}

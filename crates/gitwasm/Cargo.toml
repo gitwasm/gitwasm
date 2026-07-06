@@ -19,5 +19,13 @@ toml = "0.8"
 wasmtime = "38"
 wasmtime-wasi = { version = "38", features = ["p1"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[build-dependencies]
+# Turns the wasm32-unknown-unknown core module built from a component module
+# into a WASI 0.2 component, reading the WIT type section wit-bindgen embedded.
+wit-component = "0.244"
+
 [dev-dependencies]
 wat = "1"

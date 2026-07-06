@@ -1,7 +1,14 @@
 [package]
 name = "lineset-merge"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
-description = "3-way merge for line-set files like go.sum — runs sandboxed inside gitwasm"
+description = "3-way merge for line-set files like go.sum — a WASI 0.2 component, runs sandboxed inside gitwasm"
 
-[dependencies]
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Only the wasm build carries the component-model glue; on the host the crate
+# compiles to just its pure merge logic, so `cargo test` can exercise it and
+# the canonical-ABI export symbols never reach the host linker.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wit-bindgen = "0.51"

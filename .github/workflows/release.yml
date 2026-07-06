@@ -41,7 +41,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-wasip1, ${{ matrix.target }}
+          targets: wasm32-wasip1, wasm32-unknown-unknown, ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release -p gitwasm --target ${{ matrix.target }}

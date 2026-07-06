@@ -1,13 +1,72 @@
-use crate::gitutil::{git_bytes, git_config_all, git_ignore_failure, git_string, repo_root};
-use crate::manifest::{Manifest, GITWASM_DIR, MANIFEST_FILE};
-use crate::runner::{run_module, Sandbox};
+use crate::gitutil::{
+    git_bytes, git_config_all, git_dir, git_ignore_failure, git_string, repo_root,
+};
+use crate::manifest::{Limits, Manifest, GITWASM_DIR, MANIFEST_FILE};
+use crate::runner::{self, run_module, run_module_bytes, MergeResult, Sandbox};
 use crate::signing::{self, VerifyOutcome};
 use crate::stock;
+use crate::verdict::{self, MergeInputs, Store, Verdict};
 use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::Path;
 
 const TRUSTED_KEY_CONFIG: &str = "gitwasm.trustedkey";
+
+fn parse_init_profile(arg: Option<&str>) -> Result<stock::InitProfile> {
+    match arg.unwrap_or("all") {
+        "all" => Ok(stock::InitProfile::All),
+        "lockfiles" => Ok(stock::InitProfile::Lockfiles),
+        "hooks" => Ok(stock::InitProfile::Hooks),
+        other => bail!("unknown init profile '{other}' — expected one of: all, lockfiles, hooks"),
+    }
+}
+
+fn gitwasm_hooks_path(root: &Path) -> String {
+    root.join(GITWASM_DIR)
+        .join("hooks")
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn trim_trailing_slashes(value: &str) -> &str {
+    value.trim_end_matches(['/', '\\'])
+}
+
+fn is_gitwasm_hooks_path(root: &Path, value: &str) -> bool {
+    let value = trim_trailing_slashes(value);
+    let normalized = value.replace('\\', "/");
+    normalized == ".gitwasm/hooks" || normalized == trim_trailing_slashes(&gitwasm_hooks_path(root))
+}
+
+fn exact_config_value_regex(value: &str) -> String {
+    let mut regex = String::from("^");
+    for ch in value.chars() {
+        if matches!(
+            ch,
+            '\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|'
+        ) {
+            regex.push('\\');
+        }
+        regex.push(ch);
+    }
+    regex.push('$');
+    regex
+}
+
+fn clear_stale_gitwasm_hooks_path(root: &Path) -> Result<bool> {
+    let mut cleared = false;
+    for hooks_path in git_config_all(root, "core.hooksPath")? {
+        if is_gitwasm_hooks_path(root, &hooks_path) {
+            let value_regex = exact_config_value_regex(&hooks_path);
+            git_ignore_failure(
+                root,
+                &["config", "--unset-all", "core.hooksPath", &value_regex],
+            );
+            cleared = true;
+        }
+    }
+    Ok(cleared)
+}
 
 /// Fail-closed signature enforcement, called before any module runs.
 /// A clone that never pinned keys runs unsigned repos as before; once keys
@@ -67,7 +126,8 @@ fn pin_signers(root: &Path) -> Result<()> {
 
 /// Scaffold `.gitwasm/` with the embedded stock modules, wire up
 /// `.gitattributes`, and activate. One command from zero to protected repo.
-pub fn init() -> Result<i32> {
+pub fn init(profile_arg: Option<&str>) -> Result<i32> {
+    let profile = parse_init_profile(profile_arg)?;
     let root = repo_root()?;
     let dir = root.join(GITWASM_DIR);
     if dir.join(MANIFEST_FILE).exists() {
@@ -79,18 +139,26 @@ pub fn init() -> Result<i32> {
     }
     fs::create_dir_all(&dir)?;
 
-    for module in stock::STOCK {
+    println!("gitwasm: init profile '{}'", profile.name());
+    for module in stock::modules_for(profile) {
         fs::write(dir.join(module.file), module.bytes)?;
-        let state = if module.default_on { "on " } else { "off" };
+        let state = if profile == stock::InitProfile::Lockfiles || module.default_on {
+            "on "
+        } else {
+            "off"
+        };
         println!("gitwasm: [{state}] {: <22} {}", module.file, module.summary);
     }
-    fs::write(dir.join(MANIFEST_FILE), stock::default_manifest())?;
+    fs::write(
+        dir.join(MANIFEST_FILE),
+        stock::default_manifest_for(profile),
+    )?;
 
     // Append (never clobber) the merge-driver attributes.
     let attributes = root.join(".gitattributes");
     let existing = fs::read_to_string(&attributes).unwrap_or_default();
     let mut additions = String::new();
-    for line in stock::gitattributes_lines() {
+    for line in stock::gitattributes_lines_for(profile) {
         if !existing.lines().any(|l| l.trim() == line) {
             additions.push_str(&line);
             additions.push('\n');
@@ -118,36 +186,46 @@ pub fn install() -> Result<i32> {
     let root = repo_root()?;
     let manifest = Manifest::load(&root)?;
 
-    let hooks_dir = root.join(GITWASM_DIR).join("hooks");
-    fs::create_dir_all(&hooks_dir)?;
-    for hook_name in manifest.hooks.keys() {
-        let shim = hooks_dir.join(hook_name);
-        // sh shim, LF endings — git for Windows runs hooks through its bundled sh.
-        // Fails open when gitwasm isn't on PATH: a collaborator without the
-        // tool gets a warning, not an unusable repo.
-        fs::write(
-            &shim,
-            format!(
-                "#!/bin/sh\n\
-                 if command -v gitwasm >/dev/null 2>&1; then\n\
-                 \x20 exec gitwasm hook {hook_name} \"$@\"\n\
-                 fi\n\
-                 echo \"gitwasm: not on PATH; skipping {hook_name} hook (see .gitwasm/)\" >&2\n"
-            ),
-        )?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+    let hooks_configured = !manifest.hooks.is_empty();
+    let stale_hooks_path_cleared = if hooks_configured {
+        let hooks_dir = root.join(GITWASM_DIR).join("hooks");
+        fs::create_dir_all(&hooks_dir)?;
+        for hook_name in manifest.hooks.keys() {
+            let shim = hooks_dir.join(hook_name);
+            // sh shim, LF endings — git for Windows runs hooks through its bundled sh.
+            // Fails open when gitwasm isn't on PATH: a collaborator without the
+            // tool gets a warning, not an unusable repo.
+            fs::write(
+                &shim,
+                format!(
+                    "#!/bin/sh\n\
+                     if command -v gitwasm >/dev/null 2>&1; then\n\
+                     \x20 exec gitwasm hook {hook_name} \"$@\"\n\
+                     fi\n\
+                     echo \"gitwasm: not on PATH; skipping {hook_name} hook (see .gitwasm/)\" >&2\n"
+                ),
+            )?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&shim, fs::Permissions::from_mode(0o755))?;
+            }
+            println!(
+                "gitwasm: hook shim  {hook_name} -> {}",
+                manifest.hooks[hook_name]
+            );
         }
-        println!(
-            "gitwasm: hook shim  {hook_name} -> {}",
-            manifest.hooks[hook_name]
-        );
-    }
 
-    let hooks_path = hooks_dir.to_string_lossy().replace('\\', "/");
-    git_string(&root, &["config", "core.hooksPath", &hooks_path])?;
+        let hooks_path = gitwasm_hooks_path(&root);
+        git_string(&root, &["config", "core.hooksPath", &hooks_path])?;
+        false
+    } else if clear_stale_gitwasm_hooks_path(&root)? {
+        println!("gitwasm: cleared stale core.hooksPath for no-hook manifest");
+        true
+    } else {
+        println!("gitwasm: no hooks enabled by this manifest");
+        false
+    };
     git_string(
         &root,
         &[
@@ -169,7 +247,15 @@ pub fn install() -> Result<i32> {
         println!("gitwasm: merge rule {} -> {}", rule.pattern, rule.module);
     }
     pin_signers(&root)?;
-    println!("gitwasm: installed (core.hooksPath + merge.gitwasm.driver set for this clone)");
+    if hooks_configured {
+        println!("gitwasm: installed (core.hooksPath + merge.gitwasm.driver set for this clone)");
+    } else if stale_hooks_path_cleared {
+        println!(
+            "gitwasm: installed (merge.gitwasm.driver set for this clone; stale core.hooksPath cleared)"
+        );
+    } else {
+        println!("gitwasm: installed (merge.gitwasm.driver set for this clone; no hooks enabled)");
+    }
     Ok(0)
 }
 
@@ -345,9 +431,21 @@ pub fn hook(name: &str, hook_args: &[String]) -> Result<i32> {
     )
 }
 
+/// The outcome of running a merge module, independent of ABI: the merged bytes,
+/// or a genuine conflict the host leaves for the human.
+enum MergeOutcome {
+    Clean(Vec<u8>),
+    Conflict,
+}
+
 /// Git merge driver entry point: `gitwasm merge %O %A %B %P`.
 /// %O/%A/%B are temp files (base/ours/theirs), %P is the repo-relative path.
 /// On success the merged result must be left in %A.
+///
+/// A merge is a pure function of `(module, base, ours, theirs, path)`, so the
+/// run is memoized as a verdict: an identical computation replays its recorded
+/// result instead of re-executing, and the record can be re-derived on demand
+/// (`gitwasm audit`). See verdict.rs.
 pub fn merge(base: &str, ours: &str, theirs: &str, path: &str) -> Result<i32> {
     let root = repo_root()?;
     enforce_trust(&root)?;
@@ -357,39 +455,305 @@ pub fn merge(base: &str, ours: &str, theirs: &str, path: &str) -> Result<i32> {
         return Ok(1);
     };
     let module = Manifest::module_path(&root, module_name);
+    let module_bytes =
+        fs::read(&module).with_context(|| format!("reading {}", module.display()))?;
 
-    // The module's entire world: one temp dir with exactly these three files.
-    let tmp = tempfile::tempdir().context("creating merge sandbox dir")?;
-    copy_or_empty(base, &tmp.path().join("base"))?;
-    copy_or_empty(ours, &tmp.path().join("ours"))?;
-    copy_or_empty(theirs, &tmp.path().join("theirs"))?;
+    // git may pass a non-existent path for an absent side (no common ancestor).
+    let read_side = |p: &str| fs::read(p).unwrap_or_default();
+    let (base_b, ours_b, theirs_b) = (read_side(base), read_side(ours), read_side(theirs));
 
-    eprintln!("gitwasm: merging '{path}' with {module_name} (sandboxed)");
-    let code = run_module(
-        &module,
-        Sandbox {
-            dir: tmp.path(),
-            writable: true,
-            argv: vec![
-                module_name.to_string(),
-                "base".into(),
-                "ours".into(),
-                "theirs".into(),
-                "result".into(),
-                path.to_string(),
-            ],
-            limits: manifest.limits,
-        },
+    let inputs = MergeInputs {
+        base: verdict::sha256_hex(&base_b),
+        ours: verdict::sha256_hex(&ours_b),
+        theirs: verdict::sha256_hex(&theirs_b),
+    };
+    let key = verdict::merge_key(&verdict::sha256_hex(&module_bytes), &inputs, path);
+    let store = verdict_store(&root);
+
+    if let Some(store) = &store {
+        if let Some(recorded) = store.get(&key)? {
+            if verdict_matches_lookup_key(&recorded, &key) {
+                if let Some(code) = replay_merge(store, &recorded, ours, path, module_name)? {
+                    return Ok(code);
+                }
+            } else {
+                eprintln!("gitwasm: note: ignoring malformed verdict {}", &key[..12]);
+            }
+            // A damaged or malformed cache entry falls through to a fresh run.
+        }
+    }
+
+    let outcome = run_merge(
+        &module_bytes,
+        module_name,
+        (&base_b, &ours_b, &theirs_b),
+        path,
+        manifest.limits,
+        true,
     )?;
 
-    let result = tmp.path().join("result");
-    if code == 0 && result.exists() {
-        fs::copy(&result, ours).context("writing merge result back to %A")?;
-        Ok(0)
-    } else {
-        eprintln!("gitwasm: module reported a real conflict for '{path}'");
-        Ok(1)
+    if let Some(store) = &store {
+        record_merge(
+            store,
+            &key,
+            &module_bytes,
+            (&base_b, &ours_b, &theirs_b),
+            path,
+            &outcome,
+        )
+        .unwrap_or_else(|e| eprintln!("gitwasm: note: could not record verdict ({e:#})"));
     }
+
+    match outcome {
+        MergeOutcome::Clean(result) => {
+            fs::write(ours, result).context("writing merge result back to %A")?;
+            Ok(0)
+        }
+        MergeOutcome::Conflict => Ok(1),
+    }
+}
+
+/// Run a merge module on in-memory sides, dispatching on ABI. This is the single
+/// primitive shared by the live merge and by `gitwasm audit`'s re-derivation.
+fn run_merge(
+    module_bytes: &[u8],
+    module_name: &str,
+    sides: (&[u8], &[u8], &[u8]),
+    path: &str,
+    limits: Limits,
+    announce: bool,
+) -> Result<MergeOutcome> {
+    let (base, ours, theirs) = sides;
+    if runner::is_component(module_bytes) {
+        if announce {
+            eprintln!(
+                "gitwasm: merging '{path}' with {module_name} (sandboxed component, no mount)"
+            );
+        }
+        match runner::run_component_merge(module_bytes, base, ours, theirs, path, limits)? {
+            MergeResult::Merged(bytes) => Ok(MergeOutcome::Clean(bytes)),
+            MergeResult::Conflict(reason) => {
+                if announce {
+                    eprintln!("gitwasm: component reports a real conflict for '{path}': {reason}");
+                }
+                Ok(MergeOutcome::Conflict)
+            }
+        }
+    } else {
+        if announce {
+            eprintln!("gitwasm: merging '{path}' with {module_name} (sandboxed)");
+        }
+        let tmp = tempfile::tempdir().context("creating merge sandbox dir")?;
+        fs::write(tmp.path().join("base"), base)?;
+        fs::write(tmp.path().join("ours"), ours)?;
+        fs::write(tmp.path().join("theirs"), theirs)?;
+        let code = run_module_bytes(
+            module_bytes,
+            Sandbox {
+                dir: tmp.path(),
+                writable: true,
+                argv: vec![
+                    module_name.to_string(),
+                    "base".into(),
+                    "ours".into(),
+                    "theirs".into(),
+                    "result".into(),
+                    path.to_string(),
+                ],
+                limits,
+            },
+        )?;
+        let result = tmp.path().join("result");
+        if code == 0 && result.exists() {
+            Ok(MergeOutcome::Clean(fs::read(result)?))
+        } else {
+            if announce {
+                eprintln!("gitwasm: module reported a real conflict for '{path}'");
+            }
+            Ok(MergeOutcome::Conflict)
+        }
+    }
+}
+
+/// The verdict store for this clone, unless disabled. Never fatal — a merge must
+/// still work if the cache can't be opened.
+fn verdict_store(root: &Path) -> Option<Store> {
+    if std::env::var_os("GITWASM_NO_VERDICTS").is_some() {
+        return None;
+    }
+    match git_dir(root).and_then(|dir| Store::open(&dir)) {
+        Ok(store) => Some(store),
+        Err(e) => {
+            eprintln!("gitwasm: note: verdict cache unavailable ({e:#})");
+            None
+        }
+    }
+}
+
+fn verdict_matches_lookup_key(verdict: &Verdict, lookup_key: &str) -> bool {
+    verdict.key == lookup_key && verdict.kind == "merge" && verdict.engine == verdict::ENGINE_ID
+}
+
+/// Replay a recorded verdict without running the module. Returns the exit code
+/// to use, or `None` if the entry is unusable (missing/corrupt result) so the
+/// caller re-runs from scratch.
+fn replay_merge(
+    store: &Store,
+    verdict: &Verdict,
+    ours: &str,
+    path: &str,
+    module_name: &str,
+) -> Result<Option<i32>> {
+    match &verdict.result {
+        Some(result_hash) => match store.get_blob(result_hash) {
+            Ok(bytes) => {
+                fs::write(ours, bytes).context("writing memoized result to %A")?;
+                eprintln!(
+                    "gitwasm: memoized '{path}' via {module_name} → verdict {} (clean; `gitwasm audit` re-derives)",
+                    &verdict.key[..12]
+                );
+                Ok(Some(0))
+            }
+            Err(_) => Ok(None),
+        },
+        None => {
+            eprintln!(
+                "gitwasm: memoized '{path}' via {module_name} → verdict {} (conflict)",
+                &verdict.key[..12]
+            );
+            Ok(Some(verdict.exit_code.max(1)))
+        }
+    }
+}
+
+/// Record a fresh merge computation: store the module, the three sides, and the
+/// result content-addressed, then the verdict that ties them together.
+fn record_merge(
+    store: &Store,
+    key: &str,
+    module_bytes: &[u8],
+    sides: (&[u8], &[u8], &[u8]),
+    path: &str,
+    outcome: &MergeOutcome,
+) -> Result<()> {
+    let inputs = MergeInputs {
+        base: store.put_blob(sides.0)?,
+        ours: store.put_blob(sides.1)?,
+        theirs: store.put_blob(sides.2)?,
+    };
+    let (exit_code, result) = match outcome {
+        MergeOutcome::Clean(bytes) => (0, Some(store.put_blob(bytes)?)),
+        MergeOutcome::Conflict => (1, None),
+    };
+    store.put(&Verdict {
+        key: key.to_string(),
+        kind: "merge".into(),
+        module: store.put_blob(module_bytes)?,
+        path: path.to_string(),
+        exit_code,
+        result,
+        engine: verdict::ENGINE_ID.to_string(),
+        inputs,
+    })
+}
+
+/// List the verdicts recorded in this clone's cache.
+pub fn verdicts() -> Result<i32> {
+    let root = repo_root()?;
+    let store = Store::open(&git_dir(&root)?)?;
+    let recorded = store.list()?;
+    if recorded.is_empty() {
+        println!("gitwasm: no verdicts recorded yet — they accrue as modules run");
+        return Ok(0);
+    }
+    for verdict in &recorded {
+        let status = if verdict.result.is_some() {
+            "clean"
+        } else {
+            "conflict"
+        };
+        println!(
+            "{}  {:<6} {:<8} {}",
+            &verdict.key[..12],
+            verdict.kind,
+            status,
+            verdict.path
+        );
+    }
+    println!(
+        "gitwasm: {} verdict(s) — `gitwasm audit` re-derives every one",
+        recorded.len()
+    );
+    Ok(0)
+}
+
+/// Re-derive recorded verdicts from their content-addressed inputs and confirm
+/// each reproduces exactly. This is the trustless core of the whole idea: a
+/// verdict you cannot reproduce is a verdict you have no reason to believe.
+/// Exit nonzero if any verdict fails to reproduce.
+pub fn audit(selector: Option<&str>) -> Result<i32> {
+    let root = repo_root()?;
+    let store = Store::open(&git_dir(&root)?)?;
+    let limits = Manifest::load(&root)?.limits;
+    let to_check = match selector {
+        Some(key) => vec![store
+            .get(key)?
+            .with_context(|| format!("no verdict with key {key}"))?],
+        None => store.list()?,
+    };
+    if to_check.is_empty() {
+        println!("gitwasm: no verdicts to audit");
+        return Ok(0);
+    }
+
+    let (mut reproduced, mut failed) = (0usize, 0usize);
+    for verdict in &to_check {
+        let short = &verdict.key[..12];
+        match rederive_merge(&store, verdict, limits) {
+            Ok(true) => {
+                println!("gitwasm: {short} reproduces ({})", verdict.path);
+                reproduced += 1;
+            }
+            Ok(false) => {
+                eprintln!("gitwasm: {short} DOES NOT reproduce ({})", verdict.path);
+                failed += 1;
+            }
+            Err(e) => {
+                eprintln!("gitwasm: {short} cannot be audited: {e:#}");
+                failed += 1;
+            }
+        }
+    }
+    println!("gitwasm: {reproduced} reproduced, {failed} failed");
+    Ok(i32::from(failed > 0))
+}
+
+/// Re-run a merge verdict from its stored inputs and check it matches the record
+/// exactly (same conflict-or-clean, same result bytes).
+fn rederive_merge(store: &Store, verdict: &Verdict, limits: Limits) -> Result<bool> {
+    if verdict.kind != "merge" {
+        bail!("cannot audit verdict of kind '{}'", verdict.kind);
+    }
+    let module = store.get_blob(&verdict.module)?;
+    let base = store.get_blob(&verdict.inputs.base)?;
+    let ours = store.get_blob(&verdict.inputs.ours)?;
+    let theirs = store.get_blob(&verdict.inputs.theirs)?;
+
+    let outcome = run_merge(
+        &module,
+        "audit",
+        (&base, &ours, &theirs),
+        &verdict.path,
+        limits,
+        false,
+    )?;
+    Ok(match (&outcome, &verdict.result) {
+        (MergeOutcome::Clean(bytes), Some(hash)) => {
+            verdict.exit_code == 0 && &verdict::sha256_hex(bytes) == hash
+        }
+        (MergeOutcome::Conflict, None) => verdict.exit_code != 0,
+        _ => false,
+    })
 }
 
 /// Dev utility: run any module with the current directory preopened read-only.
@@ -397,6 +761,12 @@ pub fn run_direct(wasm: &str, args: &[String]) -> Result<i32> {
     let wasm_path = Path::new(wasm);
     if !wasm_path.exists() {
         bail!("no such module: {wasm}");
+    }
+    if runner::is_component(&fs::read(wasm_path)?) {
+        bail!(
+            "{wasm} is a component-model module — components are typed merge \
+             drivers invoked via `gitwasm merge`, not `gitwasm run`"
+        );
     }
     let mut argv = vec![wasm.to_string()];
     argv.extend(args.iter().cloned());
@@ -412,11 +782,122 @@ pub fn run_direct(wasm: &str, args: &[String]) -> Result<i32> {
     )
 }
 
-fn copy_or_empty(src: &str, dest: &Path) -> Result<()> {
-    if Path::new(src).exists() {
-        fs::copy(src, dest).with_context(|| format!("copying {src}"))?;
-    } else {
-        fs::write(dest, b"")?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_init_profile_defaults_to_all() {
+        assert_eq!(parse_init_profile(None).unwrap(), stock::InitProfile::All);
     }
-    Ok(())
+
+    #[test]
+    fn parse_init_profile_accepts_named_profiles() {
+        assert_eq!(
+            parse_init_profile(Some("lockfiles")).unwrap(),
+            stock::InitProfile::Lockfiles
+        );
+        assert_eq!(
+            parse_init_profile(Some("hooks")).unwrap(),
+            stock::InitProfile::Hooks
+        );
+        assert_eq!(
+            parse_init_profile(Some("all")).unwrap(),
+            stock::InitProfile::All
+        );
+    }
+
+    #[test]
+    fn parse_init_profile_rejects_unknown_profile() {
+        let err = parse_init_profile(Some("everything")).unwrap_err();
+        assert!(format!("{err:#}").contains("unknown init profile"));
+        assert!(format!("{err:#}").contains("lockfiles"));
+    }
+
+    #[test]
+    fn gitwasm_hooks_path_matches_absolute_managed_path() {
+        let root = Path::new("/tmp/example-repo");
+        assert!(is_gitwasm_hooks_path(
+            root,
+            "/tmp/example-repo/.gitwasm/hooks"
+        ));
+    }
+
+    #[test]
+    fn gitwasm_hooks_path_matches_relative_managed_path() {
+        let root = Path::new("/tmp/example-repo");
+        assert!(is_gitwasm_hooks_path(root, ".gitwasm/hooks"));
+    }
+
+    #[test]
+    fn gitwasm_hooks_path_rejects_user_owned_path() {
+        let root = Path::new("/tmp/example-repo");
+        assert!(!is_gitwasm_hooks_path(root, ".githooks"));
+        assert!(!is_gitwasm_hooks_path(
+            root,
+            "/tmp/example-repo/custom-hooks"
+        ));
+    }
+
+    fn lineset_component() -> &'static [u8] {
+        stock::STOCK
+            .iter()
+            .find(|m| m.file == "lineset-merge.wasm")
+            .expect("lineset-merge is a stock module")
+            .bytes
+    }
+
+    /// The full verdict cycle on the real embedded component: run → record →
+    /// re-derive (matches) → tamper the record (no longer reproduces).
+    #[test]
+    fn merge_verdict_records_rederives_and_catches_tampering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(tmp.path()).unwrap();
+        let module = lineset_component();
+        let sides = (
+            b"a\n".as_slice(),
+            b"a\nb\n".as_slice(),
+            b"a\nc\n".as_slice(),
+        );
+
+        let inputs = MergeInputs {
+            base: verdict::sha256_hex(sides.0),
+            ours: verdict::sha256_hex(sides.1),
+            theirs: verdict::sha256_hex(sides.2),
+        };
+        let key = verdict::merge_key(&verdict::sha256_hex(module), &inputs, "go.sum");
+
+        let outcome =
+            run_merge(module, "lineset", sides, "go.sum", Limits::default(), false).unwrap();
+        assert!(
+            matches!(outcome, MergeOutcome::Clean(_)),
+            "disjoint lines merge clean"
+        );
+        record_merge(&store, &key, module, sides, "go.sum", &outcome).unwrap();
+
+        let recorded = store.get(&key).unwrap().expect("verdict was recorded");
+        assert!(
+            verdict_matches_lookup_key(&recorded, &key),
+            "a freshly recorded verdict must match its lookup key"
+        );
+        assert!(
+            rederive_merge(&store, &recorded, Limits::default()).unwrap(),
+            "an honest verdict must re-derive"
+        );
+
+        let mut wrong_key = recorded.clone();
+        wrong_key.key = "0".repeat(64);
+        assert!(
+            !verdict_matches_lookup_key(&wrong_key, &key),
+            "a verdict whose metadata key differs from its lookup key is unusable"
+        );
+
+        // A verdict claiming a different result must fail re-derivation.
+        let mut forged = recorded.clone();
+        forged.result = Some(verdict::sha256_hex(b"a forgery"));
+        assert!(
+            !rederive_merge(&store, &forged, Limits::default()).unwrap(),
+            "a forged result must not reproduce"
+        );
+    }
 }

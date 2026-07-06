@@ -28,3 +28,7 @@ module = "yarn-lock-merge.wasm"
 [[merge]]
 pattern = "poetry.lock"
 module = "poetry-lock-merge.wasm"
+
+[[merge]]
+pattern = "pnpm-lock.yaml"
+module = "pnpm-lock-merge.wasm"

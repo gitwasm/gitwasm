@@ -1,15 +1,37 @@
 # gitwasm end-to-end demo (Windows). See run-demo.sh for the CI/unix version.
-# Proves four things in a throwaway repo:
+# Proves in a throwaway repo:
 #   1. package-lock.json merges that always conflict in git merge cleanly
 #   2. Cargo.lock concurrent dependency bumps resolve to the higher version
-#   3. a staged AWS key blocks the commit (sandboxed pre-commit)
-#   4. commit-lint (opt-in) rejects non-conventional messages
+#   3. pnpm-lock.yaml concurrent dependency additions merge cleanly
+#   4. go.sum merges via a typed WASI 0.2 component that imports nothing
+#   5. a staged AWS key blocks the commit (sandboxed pre-commit)
+#   6. commit-lint (opt-in) rejects non-conventional messages
+#   7. a tampered signed module refuses to run (fail-closed)
+#   8. every merge is a cached, content-addressed verdict you can re-derive
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 function Assert($cond, $msg) { if (-not $cond) { throw "DEMO FAILED: $msg" }; Write-Host $msg -ForegroundColor Green }
+function Require-NativeSuccess($msg) { if ($LASTEXITCODE -ne 0) { throw $msg } }
+
+function Replace-Required([string]$text, [string]$pattern, [string]$replacement, [string]$label) {
+    $updated = $text -replace $pattern, $replacement
+    if ($updated -eq $text) {
+        throw "pnpm lock mutation failed: $label pattern did not match"
+    }
+    return $updated
+}
+
+function Add-PnpmLockDependency([string]$name, [string]$specifier, [string]$version, [string]$integrity) {
+    $content = (Get-Content pnpm-lock.yaml -Raw) -replace "`r`n", "`n"
+    $updated = $content
+    $updated = Replace-Required $updated "      express:`n        specifier: \^4\.19\.0`n        version: 4\.19\.2" "      express:`n        specifier: ^4.19.0`n        version: 4.19.2`n      ${name}:`n        specifier: ${specifier}`n        version: ${version}" "${name} importer dependency"
+    $updated = Replace-Required $updated "  express@4\.19\.2:`n    resolution: \{integrity: sha512-express\}" "  express@4.19.2:`n    resolution: {integrity: sha512-express}`n  ${name}@${version}:`n    resolution: {integrity: ${integrity}}" "${name} package record"
+    $updated = Replace-Required $updated "  express@4\.19\.2: \{\}" "  express@4.19.2: {}`n  ${name}@${version}: {}" "${name} snapshot record"
+    Set-Content -NoNewline pnpm-lock.yaml $updated
+}
 
 Step "Building gitwasm (stock modules are compiled and embedded automatically)"
 cargo build --release -p gitwasm --manifest-path "$root\Cargo.toml"
@@ -55,12 +77,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "aaa"
 '@
 
-    Step "gitwasm init - one command from zero to protected repo"
-    gitwasm init
-    if ($LASTEXITCODE -ne 0) { throw "gitwasm init failed" }
+    Step "gitwasm init lockfiles - one command from zero to lockfile conflict protection"
+    gitwasm init lockfiles
+    if ($LASTEXITCODE -ne 0) { throw "gitwasm init lockfiles failed" }
     git add -A
     git commit -q -m "chore: adopt gitwasm"
     if ($LASTEXITCODE -ne 0) { throw "initial commit failed" }
+
+    Step "Enable the default hook pack for policy scenarios"
+    Copy-Item (Join-Path $root ".gitwasm\secret-scan.wasm") .gitwasm\
+    Copy-Item (Join-Path $root ".gitwasm\commit-lint.wasm") .gitwasm\
+    $manifestPath = ".gitwasm\manifest.toml"
+    $manifest = Get-Content $manifestPath -Raw
+    $hookLines = @()
+    if ($manifest -notmatch '(?m)^pre-commit = "secret-scan\.wasm"$') {
+        $hookLines += 'pre-commit = "secret-scan.wasm"'
+    }
+    if ($manifest -notmatch '(?m)^# commit-msg = "commit-lint\.wasm"$' -and $manifest -notmatch '(?m)^commit-msg = "commit-lint\.wasm"$') {
+        $hookLines += '# commit-msg = "commit-lint.wasm"'
+    }
+    if ($hookLines.Count -gt 0) {
+        $insert = ($hookLines -join "`n") + "`n"
+        $manifest = $manifest -replace "\[hooks\]`r?`n", ("[hooks]`n" + $insert)
+        Set-Content $manifestPath $manifest
+    }
+    gitwasm install
+    if ($LASTEXITCODE -ne 0) { throw "gitwasm install failed after hook activation" }
+    git add -A
+    git commit -q -m "chore: enable gitwasm hooks"
+    if ($LASTEXITCODE -ne 0) { throw "hook activation commit failed" }
     gitwasm list
 
     Step "Scenario 1: npm lockfile - both branches add a dependency (adjacent lines)"
@@ -93,26 +138,84 @@ checksum = "aaa"
     $lock = Get-Content Cargo.lock -Raw
     Assert ($lock -match '1\.0\.150' -and $lock -notmatch '1\.0\.120') "2. Cargo.lock merged clean, higher version (1.0.150) won"
 
-    Step "Scenario 3: staged AWS key must block the commit"
+    Step "Scenario 3: pnpm-lock.yaml - both branches add a dependency"
+    Set-Content pnpm-lock.yaml @'
+lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      express:
+        specifier: ^4.19.0
+        version: 4.19.2
+
+packages:
+  express@4.19.2:
+    resolution: {integrity: sha512-express}
+
+snapshots:
+  express@4.19.2: {}
+'@
+    git add pnpm-lock.yaml
+    Require-NativeSuccess "pnpm git add failed"
+    git commit -q -m "chore: add pnpm lock baseline"
+    Require-NativeSuccess "pnpm baseline commit failed"
+    git checkout -q -b pnpm-feature
+    Require-NativeSuccess "pnpm feature branch checkout failed"
+    Add-PnpmLockDependency "left-pad" "^1.3.0" "1.3.0" "sha512-left"
+    git commit -q -am "feat: add left-pad to pnpm lock"
+    Require-NativeSuccess "pnpm left-pad commit failed"
+    git checkout -q main
+    Require-NativeSuccess "pnpm main checkout failed"
+    Add-PnpmLockDependency "right-pad" "^1.0.1" "1.0.1" "sha512-right"
+    git commit -q -am "feat: add right-pad to pnpm lock"
+    Require-NativeSuccess "pnpm right-pad commit failed"
+    git merge pnpm-feature -m "Merge branch 'pnpm-feature'"
+    if ($LASTEXITCODE -ne 0) { throw "pnpm lockfile merge conflicted" }
+    $pnpm = Get-Content pnpm-lock.yaml -Raw
+    Assert (
+        $pnpm -match '(?m)^      left-pad:$' -and
+        $pnpm -match '(?m)^      right-pad:$' -and
+        $pnpm -match '(?m)^  left-pad@1\.3\.0:$' -and
+        $pnpm -match '(?m)^  right-pad@1\.0\.1:$' -and
+        $pnpm -match '(?m)^  left-pad@1\.3\.0: \{\}$' -and
+        $pnpm -match '(?m)^  right-pad@1\.0\.1: \{\}$'
+    ) "3. pnpm-lock.yaml merged clean with both dependencies"
+
+    Step "Scenario 4: go.sum merges via a typed WASI 0.2 component (imports nothing)"
+    Set-Content go.sum "golang.org/x/sys v0.1.0 h1:base=`ngolang.org/x/sys v0.1.0/go.mod h1:base="
+    git add go.sum; git commit -q -m "chore: add go.sum baseline"
+    git checkout -q -b gosum-feature
+    Add-Content go.sum "golang.org/x/text v0.3.0 h1:txt=`ngolang.org/x/text v0.3.0/go.mod h1:txt="
+    git commit -q -am "feat: add x/text to go.sum"
+    git checkout -q main
+    Add-Content go.sum "golang.org/x/net v0.5.0 h1:net=`ngolang.org/x/net v0.5.0/go.mod h1:net="
+    git commit -q -am "feat: add x/net to go.sum"
+    git merge gosum-feature -m "Merge branch 'gosum-feature'"
+    if ($LASTEXITCODE -ne 0) { throw "go.sum merge conflicted" }
+    $gosum = Get-Content go.sum -Raw
+    Assert ($gosum -match "x/text" -and $gosum -match "x/net" -and $gosum -match "x/sys") "4. go.sum merged clean by a component that never sees a filesystem"
+
+    Step "Scenario 5: staged AWS key must block the commit"
     # Assembled at runtime so this script itself never contains a key-shaped literal.
     Set-Content config.js ('const awsKey = "' + 'AKIA' + 'IOSFODNN7EXAMPLE' + '";')
     git add config.js
     git commit -q -m "feat: add config" 2>&1 | Out-String | Write-Host
-    Assert ($LASTEXITCODE -ne 0) "3. commit with AWS key was blocked by sandboxed pre-commit"
+    Assert ($LASTEXITCODE -ne 0) "5. commit with AWS key was blocked by sandboxed pre-commit"
     Set-Content config.js 'const awsKey = process.env.AWS_ACCESS_KEY_ID;'
     git add config.js
     git commit -q -m "feat: add config (key from env)"
     if ($LASTEXITCODE -ne 0) { throw "clean commit was blocked" }
 
-    Step "Scenario 4: enable opt-in commit-lint, reject a sloppy message"
+    Step "Scenario 6: enable opt-in commit-lint, reject a sloppy message"
     (Get-Content .gitwasm\manifest.toml -Raw) -replace '# commit-msg', 'commit-msg' | Set-Content .gitwasm\manifest.toml
     gitwasm install | Out-Null
     git commit -q --allow-empty -m "asdf" 2>&1 | Out-String | Write-Host
-    Assert ($LASTEXITCODE -ne 0) "4a. non-conventional message rejected"
+    Assert ($LASTEXITCODE -ne 0) "6a. non-conventional message rejected"
     git commit -q --allow-empty -m "feat: a proper conventional message"
-    Assert ($LASTEXITCODE -eq 0) "4b. conventional message accepted"
+    Assert ($LASTEXITCODE -eq 0) "6b. conventional message accepted"
 
-    Step "Scenario 5: sign .gitwasm/, then tamper with a module - must refuse to run"
+    Step "Scenario 7: sign .gitwasm/, then tamper with a module - must refuse to run"
     $env:GITWASM_KEY_PATH = Join-Path $PSScriptRoot "demo-signing-key"
     if (Test-Path $env:GITWASM_KEY_PATH) { Remove-Item $env:GITWASM_KEY_PATH }
     gitwasm keygen | Out-Null
@@ -122,14 +225,27 @@ checksum = "aaa"
     if ($LASTEXITCODE -ne 0) { throw "signed commit failed" }
     Add-Content -Path .gitwasm\secret-scan.wasm -Value "x" -NoNewline   # the attack: swap/patch a committed module
     gitwasm verify 2>&1 | Out-String | Write-Host
-    Assert ($LASTEXITCODE -ne 0) "5a. tampered module fails gitwasm verify"
+    Assert ($LASTEXITCODE -ne 0) "7a. tampered module fails gitwasm verify"
     git commit -q --allow-empty -m "feat: innocent looking commit" 2>&1 | Out-String | Write-Host
-    Assert ($LASTEXITCODE -ne 0) "5b. tampered module refuses to run - commit blocked fail-closed"
+    Assert ($LASTEXITCODE -ne 0) "7b. tampered module refuses to run - commit blocked fail-closed"
     git checkout -q -- .gitwasm
     git commit -q --allow-empty -m "feat: after restore everything works"
-    Assert ($LASTEXITCODE -eq 0) "5c. restored content verifies and runs again"
+    Assert ($LASTEXITCODE -eq 0) "7c. restored content verifies and runs again"
 
-    Step "Demo complete - all five scenarios passed"
+    Step "Scenario 8: verdicts - every merge above is a re-derivable, cached fact"
+    gitwasm verdicts
+    gitwasm audit
+    if ($LASTEXITCODE -ne 0) { throw "clean audit failed" }
+    $vdir = Join-Path (git rev-parse --absolute-git-dir) "gitwasm\verdicts"
+    $v = (Get-ChildItem (Join-Path $vdir "*.toml") | Select-Object -First 1).FullName
+    (Get-Content $v -Raw) -replace 'exit_code = 0', 'exit_code = 1' | Set-Content $v   # forge a different outcome
+    gitwasm audit 2>&1 | Out-String | Write-Host
+    Assert ($LASTEXITCODE -ne 0) "8a. a forged verdict fails re-derivation - you cannot lie about a verdict"
+    (Get-Content $v -Raw) -replace 'exit_code = 1', 'exit_code = 0' | Set-Content $v
+    gitwasm audit | Out-Null
+    Assert ($LASTEXITCODE -eq 0) "8b. restored verdict re-derives - merges are cached and trustlessly checkable"
+
+    Step "Demo complete - all eight scenarios passed"
     Write-Host "Every behavior above is a wasm blob COMMITTED IN THE REPO, running sandboxed"
     Write-Host "(one mounted directory, no network, no env, fuel + memory limits)."
     Write-Host "Anyone who clones and runs 'gitwasm install' gets identical behavior on any OS."

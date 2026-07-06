@@ -7,20 +7,29 @@ new module or second implementation strengthens it.
 ## Building
 
 ```
-rustup target add wasm32-wasip1
+rustup target add wasm32-wasip1 wasm32-unknown-unknown
 cargo build --release -p gitwasm     # build.rs compiles + embeds stock modules
 cargo test --workspace
 ./demo/run-demo.sh                   # or demo\run-demo.ps1 on Windows
 ```
 
+(`wasm32-unknown-unknown` is only needed for the component modules, which are
+compiled there and then wrapped into WASI 0.2 components at build time.)
+
 ## Writing a module
 
-A module is any WASI preview1 command program (`wasm32-wasip1` target). Read
-SPEC.md §4 for the exact contract; `modules/commit-lint` is the smallest
-example (~80 lines, zero dependencies). In short:
+Modules come in two flavors (SPEC.md §5). Read SPEC.md §4 for the exact
+contracts; `modules/commit-lint` is the smallest preview1 example (~80 lines,
+zero dependencies) and `modules/lineset-merge` the smallest component one.
 
-- **hook module**: scan the mounted staged tree, exit nonzero to block;
-- **merge module**: read `base`/`ours`/`theirs`, write `result`, exit 0.
+- **preview1 command module** (`wasm32-wasip1`, any language): a hook scans
+  the mounted staged tree and exits nonzero to block; a merge driver reads
+  `base`/`ours`/`theirs` and writes `result`.
+- **component merge module** (`wasm32-unknown-unknown` + `wit-bindgen`): export
+  the typed `gitwasm:merge/driver` world from `wit/driver.wit` and return
+  `ok(bytes)` or `err(reason)`. The world imports nothing, so keep the guest
+  glue behind `#[cfg(target_arch = "wasm32")]` and put the real logic in a
+  plain function you can unit-test on the host.
 
 Keep modules deterministic (no clocks, no randomness) and dependency-light —
 the blob ships inside user repositories, so size is a feature.

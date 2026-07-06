@@ -1,0 +1,29 @@
+package gitwasm:merge@0.1.0;
+
+/// A merge driver expressed as typed I/O. The host hands the module three
+/// input blobs (the common ancestor and the two sides) plus the repo-relative
+/// path being merged; the module returns either the merged bytes or a
+/// human-readable conflict reason.
+///
+/// The crucial property is what this world does NOT import: nothing. A module
+/// implementing it cannot name the filesystem, argv, environment, clock, or
+/// stdio — those capabilities do not exist in its instance. This is a strictly
+/// stronger sandbox than the preview1 ABI (which at least mounts one directory
+/// and inherits stdout/stderr), and it needs no directory materialization on
+/// the host at all: the bytes go in and out through the typed boundary.
+interface driver {
+  /// `ok(bytes)` is a clean structural merge; `err(reason)` is a genuine
+  /// conflict the host leaves for the human, exactly as git would.
+  merge3: func(
+    base: list<u8>,
+    ours: list<u8>,
+    theirs: list<u8>,
+    path: string,
+  ) -> result<list<u8>, string>;
+}
+
+/// The world a component-model merge module exports. Build any language that
+/// targets the component model against this and gitwasm will run it.
+world merge-driver {
+  export driver;
+}

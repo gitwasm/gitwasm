@@ -7,6 +7,7 @@ members = [
     "modules/lineset-merge",
     "modules/yarn-lock-merge",
     "modules/poetry-lock-merge",
+    "modules/pnpm-lock-merge",
     "modules/secret-scan",
     "modules/commit-lint",
 ]

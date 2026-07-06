@@ -5,3 +5,4 @@ package.json merge=gitwasm
 go.sum merge=gitwasm
 yarn.lock merge=gitwasm
 poetry.lock merge=gitwasm
+pnpm-lock.yaml merge=gitwasm
