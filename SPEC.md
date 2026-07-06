@@ -201,6 +201,10 @@ self-contained and reproducible. The reference host keys a merge on
 `(module, base, ours, theirs, path, engine)` and stores verdicts and blobs under
 `<git-dir>/gitwasm/` (a per-clone cache; `gitwasm verdicts` lists them).
 
+Replay is an optimization over locally recorded state. Audit is the trust operation:
+a host re-runs the module with the stored inputs and accepts the verdict only if
+the result reproduces exactly.
+
 Two properties follow, and a conforming host MUST preserve both:
 
 - **Replay is sound** — a host may skip execution on a key hit only if the stored

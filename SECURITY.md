@@ -40,6 +40,11 @@ Honesty matters more than marketing here:
    is industry-grade and fuzzed, but not a mathematical guarantee.
 3. **Activation is explicit by design.** Nothing runs on `git clone`. Until
    you run `gitwasm install`, a cloned repo's modules are inert bytes.
+4. **Local cache tampering.** Verdict replay is a local cache optimization, not
+   proof by itself. A verdict becomes evidence only when `gitwasm audit`
+   re-derives it from stored module bytes and input blobs. Future imported
+   verdicts must not be treated as replay-eligible proof until audited or
+   explicitly trusted.
 
 ## Signing
 

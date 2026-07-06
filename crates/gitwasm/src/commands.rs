@@ -472,10 +472,14 @@ pub fn merge(base: &str, ours: &str, theirs: &str, path: &str) -> Result<i32> {
 
     if let Some(store) = &store {
         if let Some(recorded) = store.get(&key)? {
-            if let Some(code) = replay_merge(store, &recorded, ours, path, module_name)? {
-                return Ok(code);
+            if verdict_matches_lookup_key(&recorded, &key) {
+                if let Some(code) = replay_merge(store, &recorded, ours, path, module_name)? {
+                    return Ok(code);
+                }
+            } else {
+                eprintln!("gitwasm: note: ignoring malformed verdict {}", &key[..12]);
             }
-            // A damaged cache entry falls through to a fresh run.
+            // A damaged or malformed cache entry falls through to a fresh run.
         }
     }
 
@@ -584,6 +588,10 @@ fn verdict_store(root: &Path) -> Option<Store> {
             None
         }
     }
+}
+
+fn verdict_matches_lookup_key(verdict: &Verdict, lookup_key: &str) -> bool {
+    verdict.key == lookup_key && verdict.kind == "merge" && verdict.engine == verdict::ENGINE_ID
 }
 
 /// Replay a recorded verdict without running the module. Returns the exit code
@@ -869,8 +877,19 @@ mod tests {
 
         let recorded = store.get(&key).unwrap().expect("verdict was recorded");
         assert!(
+            verdict_matches_lookup_key(&recorded, &key),
+            "a freshly recorded verdict must match its lookup key"
+        );
+        assert!(
             rederive_merge(&store, &recorded, Limits::default()).unwrap(),
             "an honest verdict must re-derive"
+        );
+
+        let mut wrong_key = recorded.clone();
+        wrong_key.key = "0".repeat(64);
+        assert!(
+            !verdict_matches_lookup_key(&wrong_key, &key),
+            "a verdict whose metadata key differs from its lookup key is unusable"
         );
 
         // A verdict claiming a different result must fail re-derivation.

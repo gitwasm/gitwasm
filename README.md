@@ -115,12 +115,12 @@ and [SECURITY.md](SECURITY.md).
 Every module run is a pure function of content-addressed inputs, so gitwasm
 records each merge as a **verdict** — `hash(module) + hash(inputs) → {exit,
 result}`, with the module and inputs stored content-addressed under
-`.git/gitwasm/`. An identical merge then replays its recorded result instead of
-re-running, and `gitwasm audit` re-derives every verdict from its stored inputs
-to prove the record is honest — *a verdict you cannot reproduce is one you have
-no reason to believe.* This is the seed of the larger goal (SPEC.md §8): because
-verdicts are reproducible and git-native, they can travel between clones, so a
-team eventually computes each unique `(check, content)` pair exactly once.
+`.git/gitwasm/`.
+
+Replay is a local cache optimization. `gitwasm audit` is the proof step: it
+re-runs stored module bytes against stored input blobs and checks that the
+recorded outcome reproduces. Future shared verdicts must remain unaudited until
+the local host re-derives them or the user explicitly trusts their provenance.
 
 ## Roadmap
 
@@ -131,9 +131,8 @@ team eventually computes each unique `(check, content)` pair exactly once.
 - **Verdict distribution**: merge runs are already recorded as content-addressed,
   re-derivable verdicts (`gitwasm verdicts` / `gitwasm audit`, SPEC.md §8) and
   memoized per clone. Making them travel through a git ref — so a team or CI
-  computes each unique `(check, content)` pair once — is the next step toward CI
-  that never re-runs anything anyone has already run. Hooks join merges as verdict
-  producers next.
+  can audit or explicitly trust shared provenance before reusing them — is the
+  next step. Hooks join merges as verdict producers next.
 - **Upstream**: the goal is not this tool — it is `.gitwasm/` as an open
   convention git hosts understand and, eventually, native sandboxed-module
   support in git itself. This repo is the reference implementation.
