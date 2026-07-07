@@ -30,7 +30,7 @@ function Add-PnpmLockDependency([string]$name, [string]$specifier, [string]$vers
     $updated = Replace-Required $updated "      express:`n        specifier: \^4\.19\.0`n        version: 4\.19\.2" "      express:`n        specifier: ^4.19.0`n        version: 4.19.2`n      ${name}:`n        specifier: ${specifier}`n        version: ${version}" "${name} importer dependency"
     $updated = Replace-Required $updated "  express@4\.19\.2:`n    resolution: \{integrity: sha512-express\}" "  express@4.19.2:`n    resolution: {integrity: sha512-express}`n  ${name}@${version}:`n    resolution: {integrity: ${integrity}}" "${name} package record"
     $updated = Replace-Required $updated "  express@4\.19\.2: \{\}" "  express@4.19.2: {}`n  ${name}@${version}: {}" "${name} snapshot record"
-    Set-Content -NoNewline pnpm-lock.yaml $updated
+    Set-Content -Path pnpm-lock.yaml -Value $updated -NoNewline
 }
 
 Step "Building gitwasm (stock modules are compiled and embedded automatically)"

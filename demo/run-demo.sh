@@ -55,15 +55,22 @@ git commit -q -m "chore: adopt gitwasm"
 
 step "Enable the default hook pack for policy scenarios"
 cp "$ROOT/.gitwasm/secret-scan.wasm" "$ROOT/.gitwasm/commit-lint.wasm" .gitwasm/
-if ! grep -q '^pre-commit = "secret-scan.wasm"' .gitwasm/manifest.toml; then
-    sed -i.bak '/^\[hooks\]/a pre-commit = "secret-scan.wasm"' .gitwasm/manifest.toml
-    rm .gitwasm/manifest.toml.bak
-fi
-if ! grep -q '^# commit-msg = "commit-lint.wasm"' .gitwasm/manifest.toml && \
-    ! grep -q '^commit-msg = "commit-lint.wasm"' .gitwasm/manifest.toml; then
-    sed -i.bak '/^pre-commit = "secret-scan.wasm"/a # commit-msg = "commit-lint.wasm"' .gitwasm/manifest.toml
-    rm .gitwasm/manifest.toml.bak
-fi
+python3 - <<'PY'
+from pathlib import Path
+
+path = Path(".gitwasm/manifest.toml")
+lines = path.read_text().splitlines()
+
+if 'pre-commit = "secret-scan.wasm"' not in lines:
+    hooks = lines.index("[hooks]")
+    lines.insert(hooks + 1, 'pre-commit = "secret-scan.wasm"')
+
+if '# commit-msg = "commit-lint.wasm"' not in lines and 'commit-msg = "commit-lint.wasm"' not in lines:
+    pre_commit = lines.index('pre-commit = "secret-scan.wasm"')
+    lines.insert(pre_commit + 1, '# commit-msg = "commit-lint.wasm"')
+
+path.write_text("\n".join(lines) + "\n")
+PY
 gitwasm install
 git add -A
 git commit -q -m "chore: enable gitwasm hooks"
